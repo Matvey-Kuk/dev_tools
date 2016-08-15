@@ -13,6 +13,12 @@ import getopt
 import socket
 from struct import unpack
 
+ATTR_FLAGS_OPT = 0x80
+ATTR_FLAGS_TRANS = 0x40
+ATTR_FLAGS_PARTIAL = 0x20
+ATTR_FLAGS_EXLEN = 0x10
+
+
 def bgpParse_nlri_v4(data):
     """ Parses NRLI tuples (IPv4) from data buffer
 
@@ -44,6 +50,58 @@ def bgpParse_nlri_v4(data):
         i += addr_bytes
 
     return nlri_list
+
+def get_asn_encoding(attr_data, len):
+    """ Goes through all attribute data to detect the ASN encoding
+
+        Attempts to parse the AS_PATH using 4 octet. If parse fails, it's
+        2-octet encoded.  Aggregator can also be used to detect this, but
+        that attribute isn't always present.
+
+        :param attr_data:   Attribute data from BGP update message
+        :param len:         Length of the attribute data
+
+        :return: 2 for 2-octet, 4 for 4-octet, and 0 if cannot be detected
+    """
+    asn_len = 0
+    attr_read = 0
+
+    while attr_read < len:
+        (attr_flags, attr_type) = unpack('!BB', attr_data[attr_read: attr_read + 2])
+        attr_read += 2
+
+        #print "Attribute flags %x type = %r (%d/%d)" % (attr_flags, attr_type, attr_read, len)
+
+        if ATTR_FLAGS_EXLEN & attr_flags:
+            #print "Attribute %d is extended length" % attr_type
+            (attr_len,) = unpack('!H', attr_data[attr_read: attr_read + 2])
+            attr_read += 2
+        else:
+            (attr_len,) = unpack('!B', attr_data[attr_read: attr_read + 1])
+            attr_read += 1
+
+        if attr_type == 2:
+            print "Attribute is AS_PATH"
+            path_data = attr_data[attr_read: attr_read + attr_len]
+            path_read = 0
+            while path_read < attr_len:
+                (path_type, path_count) = unpack("!BB", path_data[path_read: path_read + 2])
+                path_read += 2
+                print "path seg type = %d count = %d" % (path_type, path_count)
+                path_read += 4 * path_count
+
+            if path_read > attr_len:
+                print "2-octet encoding"
+                asn_len = 2
+            else:
+                print "4-octet encoding"
+                asn_len = 4
+            break
+
+        attr_read += attr_len
+
+
+    return asn_len
 
 def bgpParse_update(fd, len):
     """ Parse BGP update message from file
@@ -77,6 +135,8 @@ def bgpParse_update(fd, len):
 
     if (withdrawn_len > 0):
         hdr['withdrawn_list'] = bgpParse_nlri_v4(withdrawn_data)
+
+    get_asn_encoding(attr_data, attr_len)
 
     return hdr
 
@@ -183,6 +243,37 @@ def bmpParse_peerHdr(fd):
     return hdr
 
 
+def bmpParse_peerUpHdr(fd, bmp_peer_hdr):
+    """ Parse BMP peer UP header from file
+
+    :param fd:              Opened file descriptor to the BMP file
+    :param bmp_peer_hdr:    Reference to the parsed bmp peer header
+
+    ..note: info TLV's should be checked after initial header parse.  BGP OPEN messages should be checked
+          after the initial header parse
+
+    :return: dictionary defined as::
+            {
+                local_address:    <string; printed form of local IP>,
+                local_port:       <int; local port>,
+                remote_port:      <int; remote port>,
+            }
+    """
+    hdr = { 'local_addr': None,
+            'local_port': 0,
+            'remote_port': 0}
+
+    if (bmp_peer_hdr['isIPv4']):
+        fd.read(12)     # skip to the ipv4 address
+        hdr['local_address'] = socket.inet_ntop(socket.AF_INET, fd.read(4))
+    else:
+        hdr['local_address'] = socket.inet_ntop(socket.AF_INET6, fd.read(16))
+
+    (hdr['local_port'], hdr['remote_port'],) = unpack('>HH', fd.read(4))
+
+    return hdr
+
+
 def bmpParse_bmpHdr(fd):
     """ Parse BMP header from file
 
@@ -274,6 +365,39 @@ def bmpRead(cfg):
 
 
                     print "  |  ----------------------"
+
+                elif (bmp_hdr['type'] == 'PEER_UP'):
+                    peer_hdr = bmpParse_peerHdr(f)
+
+                    print "  | Peer addr = %s asn = %s bgp-id = %s" % (
+                                                peer_hdr['addr'],
+                                                peer_hdr['asn'],
+                                                peer_hdr['bgp_id'])
+
+
+                    # peer_up_hdr = bmpParse_peerUpHdr(f, peer_hdr)
+                    # print "  |       local addr = %s local port = %d remote port %d" % (
+                    #
+                    #                             peer_up_hdr['local_addr'],
+                    #                             peer_up_hdr['local_port'],
+                    #                             peer_up_hdr['remote_port'])
+                    #
+                    # print "  |  ----------------------"
+                    #
+                    # bgp_hdr = bgpParse_Hdr(f)
+                    # print "  |   OPEN (sent) BGP = %r" % bgp_hdr
+                    #
+                    # bgp_hdr = bgpParse_Hdr(f)
+                    # print "  |   OPEN (recv) BGP = %r" % bgp_hdr
+
+                    print "Peer UP Hex DUMP:"
+
+                    for i in range(0, ((bmp_hdr['length'] - 42))):  # loop and hex dump the remaining data
+                        if ((i % 16) == 0):
+                            print ""
+                        value = unpack("B", f.read(1))
+                        print (" %2x " % value),
+                    print "\n"
 
                 else:
                     f.read(bmp_hdr['length'])
